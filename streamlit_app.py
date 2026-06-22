@@ -1,151 +1,742 @@
-import streamlit as st
+import time
+from datetime import datetime, timedelta
+
+
+import requests
 import pandas as pd
-import math
-from pathlib import Path
+import streamlit as st
+import plotly.graph_objects as go
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# =========================
+# CONFIG
+# =========================
+st.set_page_config(page_title="EKA – IOE en tiempo real (CO₂ + METEO)", layout="wide")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+st.title("EKA – IOE en tiempo real (Sensores CO₂ + METEO)")
+st.caption("IOE global + semáforo + ranking CO₂ + meteorología (auto-refresh)")
+
+
+# =========================
+# SIDEBAR – DEMASE (CO2)
+# =========================
+st.sidebar.header("Conexión DEMASE (CO₂)")
+
+
+demase_base_url = st.sidebar.text_input("Base URL DEMASE", "https://www.demasesl.com").strip().rstrip("/")
+demase_token = st.sidebar.text_input("Token DEMASE", type="password").strip()
+
+
+# =========================
+# SIDEBAR – METEO (Pentaho CDA)
+# =========================
+st.sidebar.header("Conexión METEO (La Palma – Pentaho CDA)")
+
+
+meteo_enabled = st.sidebar.toggle("Integrar METEO", value=True)
+
+
+meteo_base = st.sidebar.text_input(
+    "Base URL METEO",
+    "https://bi.lapalma.es/pentaho/plugin/cda/api/doQuery",
+).strip()
+
+
+meteo_path = st.sidebar.text_input(
+    "path (CDA)",
+    "/public/sc_lapalma/verticals/sql/environment.cda",
+).strip()
+
+
+meteo_trust_user = st.sidebar.text_input("_TRUST_USER_", "opendata_sc_lapalma").strip()
+
+
+# =========================
+# SIDEBAR – TIEMPO REAL
+# =========================
+st.sidebar.header("Tiempo real")
+auto_refresh = st.sidebar.toggle("Auto-refresh", value=True)
+refresh_seconds = st.sidebar.slider("Refresh (segundos)", 2, 30, 5)
+window_size = st.sidebar.slider("Ventana (puntos) IOE global", 5, 300, 80)
+
+
+# =========================
+# SIDEBAR – UMBRALES
+# =========================
+st.sidebar.header("Semáforo (IOE global)")
+ioe_red = st.sidebar.slider("ROJO si IOE < ", 0.0, 1.0, 0.35)
+ioe_yellow = st.sidebar.slider("AMARILLO si IOE < ", 0.0, 1.0, 0.55)
+
+
+if ioe_yellow <= ioe_red:
+    st.sidebar.warning("Ajuste automático: AMARILLO debe ser mayor que ROJO.")
+    ioe_yellow = min(1.0, ioe_red + 0.05)
+
+
+st.sidebar.header("Peso en IOE global")
+w_co2 = st.sidebar.slider("Peso CO₂", 0.0, 1.0, 0.75)
+w_meteo = 1.0 - w_co2
+st.sidebar.caption(f"Peso METEO = {w_meteo:.2f}")
+
+
+# =========================
+# HELPERS
+# =========================
+def classify_semaphore(ioe_value: float) -> str:
+    if ioe_value is None or pd.isna(ioe_value):
+        return "⚪ Sin datos"
+    if ioe_value < ioe_red:
+        return "🔴 ROJO"
+    if ioe_value < ioe_yellow:
+        return "🟡 AMARILLO"
+    return "🟢 VERDE"
+
+
+def safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+# =========================
+# DEMASE (CO2)
+# =========================
+def fetch_demase_data(base_url: str, token: str):
+    """Devuelve una LISTA de lecturas DEMASE o [] y muestra diagnóstico."""
+    if not base_url:
+        st.sidebar.error("DEMASE: Base URL vacía.")
+        return []
+    if not token:
+        st.sidebar.warning("DEMASE: Token vacío (pégalo en la barra lateral).")
+        return []
+
+
+    url = f"{base_url}/datos_actuales"
+    params = {"token": token}
+
+
+    with st.sidebar.expander("🧪 Diagnóstico DEMASE", expanded=False):
+        st.write("URL:", url)
+        st.write("Token length:", len(token))
+
+
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            st.write("HTTP status:", r.status_code)
+            st.write("Final URL:", r.url)
+
+
+            if r.status_code != 200:
+                st.error(f"DEMASE: respuesta no OK ({r.status_code})")
+                st.text(r.text[:1000])
+                return []
+
+
+            data = r.json()
+            if isinstance(data, list):
+                st.success(f"DEMASE JSON OK (lista) - items: {len(data)}")
+                st.json(data[:2])
+                return data
+
+
+            st.warning("DEMASE: JSON recibido pero no es lista.")
+            st.write(type(data))
+            st.json(data)
+            return []
+
+
+        except Exception as e:
+            st.error(f"DEMASE: error request/JSON: {repr(e)}")
+            return []
+
+
+def flatten_demase_rows(rows: list) -> pd.DataFrame:
+    records = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+
+        valores = row.get("valores") or {}
+        if not isinstance(valores, dict):
+            valores = {}
+
+
+        ts = row.get("Ts", None)
+        dt = pd.to_datetime(ts, unit="s", errors="coerce") if ts is not None else pd.NaT
+
+
+        records.append(
+            {
+                "sensor_id": valores.get("Id", None),
+                "timestamp": dt,
+                "co2": pd.to_numeric(valores.get("Co2", None), errors="coerce"),
+                "temp": pd.to_numeric(valores.get("temp", None), errors="coerce"),
+                "bat": pd.to_numeric(valores.get("bat", None), errors="coerce"),
+                "co2_pct": pd.to_numeric(valores.get("co2%", None), errors="coerce"),
+                "altura": row.get("Altura", None),
+            }
+        )
+
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.dropna(subset=["sensor_id"])
+        df["sensor_id"] = df["sensor_id"].astype(int)
+    return df
+
+
+def compute_ioe_co2(df: pd.DataFrame) -> pd.DataFrame:
     """
+    IOE DEMO (CO₂):
+    - CO2 alto => baja C
+    - temp alta + datos faltantes => sube A
+    """
+    out = df.copy()
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    out["missing_co2"] = out["co2"].isna().astype(int)
+    out["missing_temp"] = out["temp"].isna().astype(int)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+
+    out["co2_f"] = out["co2"].fillna(0)
+    out["temp_f"] = out["temp"].fillna(0)
+    out["bat_f"] = out["bat"].fillna(0)
+
+
+    out["co2_norm"] = (out["co2_f"] / 2000).clip(0, 1)   # 0..2000 ppm
+    out["temp_norm"] = (out["temp_f"] / 50).clip(0, 1)   # 0..50 ºC
+    out["bat_norm"] = (out["bat_f"] / 20).clip(0, 1)     # 0..20 V aprox
+
+
+    out["C"] = (1 - out["co2_norm"]).clip(0, 1)
+    out["A"] = (0.35 * out["temp_norm"] + 0.25 * out["missing_co2"] + 0.15 * out["missing_temp"]).clip(0, 1)
+    out["IOE"] = (out["C"] - out["A"]).clip(0, 1)
+
+
+    out["sensor_name"] = out["sensor_id"].apply(lambda x: f"Sensor {x}")
+    return out
+
+
+# =========================
+# METEO (Pentaho CDA)
+# =========================
+def pentaho_doquery(base_url: str, path: str, trust_user: str, data_access_id: str, extra_params: dict | None = None):
+    """
+    Llama a Pentaho CDA doQuery y devuelve dict JSON o {}.
+    Estructura típica: {"resultset": [...], "metadata": [...], ...}
+    """
+    params = {
+        "path": path,
+        "_TRUST_USER_": trust_user,
+        "dataAccessId": data_access_id,
+        "outputType": "json",
+    }
+    if extra_params:
+        params.update(extra_params)
+
+
+    try:
+        r = requests.get(base_url, params=params, timeout=25)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.sidebar.error(f"METEO: error {data_access_id}: {repr(e)}")
+        return {}
+
+
+def pentaho_json_to_df(payload: dict) -> pd.DataFrame:
+    """
+    Convierte respuesta Pentaho CDA a DataFrame usando metadata/resultset.
+    """
+    if not isinstance(payload, dict):
+        return pd.DataFrame()
+
+
+    meta = payload.get("metadata", None)
+    rs = payload.get("resultset", None)
+
+
+    if not isinstance(meta, list) or not isinstance(rs, list):
+        return pd.DataFrame()
+
+
+    colnames = []
+    for m in meta:
+        # suele venir como {"colName": "...", ...}
+        colnames.append(m.get("colName", f"col_{len(colnames)}"))
+
+
+    df = pd.DataFrame(rs, columns=colnames)
+    return df
+
+
+def fetch_meteo_stations():
+    # dataAccessId=weatherobserved_stations (doc)
+    payload = pentaho_doquery(
+        meteo_base,
+        meteo_path,
+        meteo_trust_user,
+        "weatherobserved_stations",
+        extra_params=None,
+    )
+    return pentaho_json_to_df(payload)
+
+
+def fetch_meteo_lastdata(entityid: str | None):
+    # dataAccessId=weatherobserved_lastdata (doc) + params opcionales
+    # Si no pasas entityid devuelve todas las estaciones (doc).
+    now = datetime.utcnow()
+    start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    finish = now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+    extra = {
+        "paramentityid": entityid or "",
+        "paramstart": start,
+        "paramfinish": finish,
+        "parammunicipality": "",
+    }
+
+
+    payload = pentaho_doquery(
+        meteo_base,
+        meteo_path,
+        meteo_trust_user,
+        "weatherobserved_lastdata",
+        extra_params=extra,
+    )
+    return pentaho_json_to_df(payload)
+
+
+def compute_ioe_meteo(meteo_row: pd.Series) -> float | None:
+    """
+    IOE METEO (demo robusta):
+    - Penaliza viento alto, precipitación alta, temperatura extrema.
+    Devuelve IOE 0..1 (aprox).
+    """
+    if meteo_row is None or meteo_row.empty:
+        return None
+
+
+    # Heurística: intenta encontrar columnas típicas si existen
+    cols = {c.lower(): c for c in meteo_row.index}
+
+
+    def pick(*names):
+        for n in names:
+            if n in cols:
+                return safe_float(meteo_row[cols[n]])
+        return None
+
+
+    temp = pick("temperature", "airtemperature", "temp", "tempc", "t")
+    wind = pick("windspeed", "wind_speed", "wind")
+    rain = pick("precipitation", "rain", "dailyprecipitation")
+
+
+    # Normalizaciones (ajusta si quieres)
+    # temp: penaliza por extremos (0..50)
+    if temp is None:
+        temp_pen = 0.15  # si falta, pequeña penalización
+    else:
+        # ideal 18..26, fuera penaliza
+        if 18 <= temp <= 26:
+            temp_pen = 0.0
+        else:
+            temp_pen = min(0.6, abs(temp - 22) / 30)
+
+
+    # viento: 0..20 m/s aprox (si tu unidad es distinta, ajusta)
+    if wind is None:
+        wind_pen = 0.10
+    else:
+        wind_pen = min(0.6, wind / 20)
+
+
+    # lluvia: 0..50 mm/día (aprox)
+    if rain is None:
+        rain_pen = 0.05
+    else:
+        rain_pen = min(0.6, rain / 50)
+
+
+    A = min(1.0, 0.45 * temp_pen + 0.35 * wind_pen + 0.20 * rain_pen)
+    C = max(0.0, 1.0 - A)
+    ioe = max(0.0, min(1.0, C - 0.15 * A))
+    return ioe
+
+
+# =========================
+# ESTADO (histórico)
+# =========================
+if "history" not in st.session_state:
+    st.session_state.history = []  # {"time":..., "ioe":..., "ioe_co2":..., "ioe_meteo":...}
+
+
+# =========================
+# FETCH + COMPUTE
+# =========================
+# --- CO2
+rows = fetch_demase_data(demase_base_url, demase_token)
+df_co2 = flatten_demase_rows(rows)
+ioe_co2 = None
+
+
+if not df_co2.empty:
+    df_co2 = compute_ioe_co2(df_co2)
+    ioe_co2 = float(df_co2["IOE"].mean())
+
+
+# --- METEO
+df_stations = pd.DataFrame()
+df_meteo_last = pd.DataFrame()
+selected_station = None
+ioe_meteo = None
+
+
+if meteo_enabled:
+    with st.sidebar.expander("🧪 Diagnóstico METEO", expanded=False):
+        st.write("Base:", meteo_base)
+        st.write("path:", meteo_path)
+        st.write("_TRUST_USER_:", meteo_trust_user)
+
+
+    df_stations = fetch_meteo_stations()
+
+
+    station_options = []
+    if not df_stations.empty:
+        # el doc dice que existe "entityid" y "name" :contentReference[oaicite:3]{index=3}
+        if "entityid" in df_stations.columns:
+            if "name" in df_stations.columns:
+                station_options = [
+                    f"{row['name']}  ({row['entityid']})" for _, row in df_stations.iterrows()
+                ]
+            else:
+                station_options = [str(x) for x in df_stations["entityid"].tolist()]
+
+
+    if station_options:
+        pick_label = st.sidebar.selectbox("Estación METEO", options=station_options, index=0)
+        # extrae entityid entre paréntesis si existe
+        if "(" in pick_label and pick_label.endswith(")"):
+            selected_station = pick_label.split("(")[-1].rstrip(")")
+        else:
+            selected_station = pick_label
+
+
+        df_meteo_last = fetch_meteo_lastdata(selected_station)
+    else:
+        # si no hay estaciones, intenta igualmente lastdata sin entityid (todas)
+        df_meteo_last = fetch_meteo_lastdata(None)
+
+
+    # tomar 1 fila para IOE meteo
+    if not df_meteo_last.empty:
+        meteo_row = df_meteo_last.iloc[0]
+        ioe_meteo = compute_ioe_meteo(meteo_row)
+
+
+# =========================
+# IOE GLOBAL (COMBINADO)
+# =========================
+global_ioe = None
+if ioe_co2 is not None and (not meteo_enabled or ioe_meteo is None):
+    global_ioe = ioe_co2
+elif meteo_enabled and ioe_meteo is not None and ioe_co2 is None:
+    global_ioe = ioe_meteo
+elif ioe_co2 is not None and meteo_enabled and ioe_meteo is not None:
+    global_ioe = (w_co2 * ioe_co2) + (w_meteo * ioe_meteo)
+
+
+# guardar histórico
+if global_ioe is not None:
+    st.session_state.history.append(
+        {"time": datetime.now(), "ioe": global_ioe, "ioe_co2": ioe_co2, "ioe_meteo": ioe_meteo}
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
 
-    return gdp_df
+history_df = pd.DataFrame(st.session_state.history).tail(window_size)
 
-gdp_df = get_gdp_data()
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+# =========================
+# KPIs (TOP)
+# =========================
+k1, k2, k3, k4, k5, k6 = st.columns([1.2, 1.2, 1, 1, 1, 1])
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+k1.metric("IOE GLOBAL", f"{global_ioe:.3f}" if global_ioe is not None else "—")
+k2.metric("Semáforo Global", classify_semaphore(global_ioe) if global_ioe is not None else "⚪ Sin datos")
+k3.metric("IOE CO₂", f"{ioe_co2:.3f}" if ioe_co2 is not None else "—")
+k4.metric("IOE METEO", f"{ioe_meteo:.3f}" if ioe_meteo is not None else "—")
+k5.metric("Sensores CO₂ activos", int(len(df_co2)) if not df_co2.empty else 0)
 
-# Add some spacing
-''
-''
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+if not df_co2.empty:
+    n_red = int((df_co2["IOE"] < ioe_red).sum())
+else:
+    n_red = 0
+k6.metric("CO₂ en ROJO", n_red)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
 
-countries = gdp_df['Country Code'].unique()
+# =========================
+# EVOLUCIÓN (IOE GLOBAL)
+# =========================
+st.subheader("Evolución en tiempo real (Sistema)")
 
-if not len(countries):
-    st.warning("Select at least one country")
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+if not history_df.empty:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=history_df["time"], y=history_df["ioe"], mode="lines+markers", name="IOE Global"))
+    if "ioe_co2" in history_df.columns and history_df["ioe_co2"].notna().any():
+        fig.add_trace(go.Scatter(x=history_df["time"], y=history_df["ioe_co2"], mode="lines", name="IOE CO₂"))
+    if "ioe_meteo" in history_df.columns and history_df["ioe_meteo"].notna().any():
+        fig.add_trace(go.Scatter(x=history_df["time"], y=history_df["ioe_meteo"], mode="lines", name="IOE METEO"))
 
-''
-''
-''
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+    fig.update_layout(
+        height=380,
+        xaxis_title="Tiempo",
+        yaxis_title="IOE",
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Aún no hay histórico (espera 2–3 refrescos).")
 
-st.header('GDP over time', divider='gray')
 
-''
+# =========================
+# BLOQUE METEO (TABLA)
+# =========================
+if meteo_enabled:
+    st.subheader("METEO – última medida")
+    if selected_station:
+        st.caption(f"Estación seleccionada: {selected_station}")
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+
+    if not df_meteo_last.empty:
+        st.dataframe(df_meteo_last.head(10), use_container_width=True, hide_index=True)
+    else:
+        st.info("METEO: sin datos (revisa base/path/_TRUST_USER_).")
+
+
+# =========================
+# RANKING CO2
+# =========================
+st.subheader("CO₂ – Sensores en riesgo (ranking)")
+
+
+if not df_co2.empty:
+    df_rank = df_co2.sort_values("IOE", ascending=True).copy()
+    df_rank["Semáforo"] = df_rank["IOE"].apply(classify_semaphore)
+
+
+    st.dataframe(
+        df_rank[["sensor_name", "sensor_id", "co2", "temp", "bat", "IOE", "Semáforo"]].head(25),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.info("CO₂: no hay datos (revisa DEMASE Base URL y Token).")
+
+
+# =========================
+# DETALLE SENSOR CO2 MÁS CRÍTICO
+# =========================
+st.subheader("CO₂ – Detalle del sensor más crítico")
+
+
+if not df_co2.empty:
+    worst = df_co2.sort_values("IOE").iloc[0]
+    cols = st.columns(5)
+    cols[0].metric("Sensor", str(worst["sensor_id"]))
+    cols[1].metric("CO₂ (ppm)", "—" if pd.isna(worst["co2"]) else f"{worst['co2']:.0f}")
+    cols[2].metric("Temp (ºC)", "—" if pd.isna(worst["temp"]) else f"{worst['temp']:.1f}")
+    cols[3].metric("Bat", "—" if pd.isna(worst["bat"]) else f"{worst['bat']:.2f}")
+    cols[4].metric("IOE", f"{worst['IOE']:.3f}  {classify_semaphore(worst['IOE'])}")
+else:
+    st.info("CO₂: sin datos del sensor crítico.")
+
+# =========================
+# SOFÍA – ASISTENTE EKA
+# =========================
+# =========================
+# SOFÍA – ASISTENTE EKA
+# =========================
+
+st.subheader("🤖 SOFÍA – Asistente inteligente EKA")
+
+# Guardar historial de conversación
+if "sofia_messages" not in st.session_state:
+    st.session_state.sofia_messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Hola, soy SOFÍA, tu asistente de Inteligencia Predictiva EKA. "
+                "Puedo ayudarte a entender el IOE, las alertas, los sensores críticos "
+                "y recomendar acciones preventivas."
+            )
+        }
+    ]
+
+
+# Función que genera respuestas
+def respuesta_sofia(pregunta):
+
+    pregunta = pregunta.lower()
+
+    # Estado general del sistema
+    if global_ioe is not None:
+        estado = classify_semaphore(global_ioe)
+        ioe_texto = f"{global_ioe:.3f}"
+    else:
+        estado = "Sin datos"
+        ioe_texto = "No disponible"
+
+
+    # Sensor más crítico
+    sensor_info = None
+
+    if not df_co2.empty:
+        peor = df_co2.sort_values("IOE").iloc[0]
+
+        sensor_info = {
+            "id": int(peor["sensor_id"]),
+            "ioe": peor["IOE"],
+            "co2": peor["co2"],
+            "temp": peor["temp"],
+            "bat": peor["bat"]
+        }
+
+
+    # Respuestas inteligentes
+    if "alerta" in pregunta or "anomalía" in pregunta:
+
+        return (
+            f"He detectado que el sistema se encuentra en estado {estado}. "
+            f"El IOE global actual es {ioe_texto}. "
+            "Esto significa que existen señales de pérdida de estabilidad en la red."
+        )
+
+
+    elif "ioe" in pregunta:
+
+        return (
+            f"El Índice Operativo EKA actual es {ioe_texto}. "
+            f"El estado del sistema es {estado}. "
+            "Un descenso del IOE indica una posible pérdida de coherencia "
+            "y un aumento de la incertidumbre del sistema."
+        )
+
+
+    elif "sensor" in pregunta or "crítico" in pregunta:
+
+        if sensor_info:
+
+            return (
+                f"El sensor más crítico es el Sensor {sensor_info['id']}. "
+                f"Su IOE es {sensor_info['ioe']:.3f}, "
+                f"CO₂: {sensor_info['co2']:.0f} ppm, "
+                f"Temperatura: {sensor_info['temp']:.1f} °C y "
+                f"Batería: {sensor_info['bat']:.2f} V."
+            )
+
+        else:
+
+            return "Actualmente no dispongo de sensores críticos identificados."
+
+
+    elif "fuga" in pregunta:
+
+        return (
+            "No puedo confirmar una fuga únicamente con esta señal. "
+            "Sin embargo, la pérdida de estabilidad detectada por EKA "
+            "recomienda revisar presiones, caudales, válvulas y sensores cercanos."
+        )
+
+
+    elif "qué hago" in pregunta or "recomienda" in pregunta or "acción" in pregunta:
+
+        return (
+            "Mis recomendaciones son:\n\n"
+            "1. Revisar los sensores con menor IOE.\n"
+            "2. Verificar posibles fallos de comunicación o sensores.\n"
+            "3. Comprobar presión y caudal en la zona afectada.\n"
+            "4. Inspeccionar válvulas, bombas y elementos próximos.\n"
+            "5. Mantener monitorización reforzada del sistema."
+        )
+
+
+    elif "riesgo" in pregunta:
+
+        return (
+            f"El nivel de riesgo actual es {estado}. "
+            "Mi función es detectar señales tempranas antes de que ocurra una avería visible."
+        )
+
+
+    elif "hola" in pregunta:
+
+        return (
+            "Hola, soy SOFÍA EKA. Estoy preparada para ayudarte a interpretar el estado de la red."
+        )
+
+
+    else:
+
+        return (
+            "Puedo responder preguntas como:\n\n"
+            "- ¿Cuál es el IOE actual?\n"
+            "- ¿Existe una anomalía?\n"
+            "- ¿Cuál es el sensor más crítico?\n"
+            "- ¿Hay riesgo de fuga?\n"
+            "- ¿Qué acciones recomiendas?"
+        )
+
+
+# Mostrar historial del chat
+for mensaje in st.session_state.sofia_messages:
+
+    with st.chat_message(mensaje["role"]):
+        st.markdown(mensaje["content"])
+
+
+# Caja de texto del usuario
+pregunta_usuario = st.chat_input(
+    "Pregunta a SOFÍA sobre el estado de la red..."
 )
 
-''
-''
+
+# Procesar pregunta
+if pregunta_usuario:
+
+    st.session_state.sofia_messages.append(
+        {
+            "role": "user",
+            "content": pregunta_usuario
+        }
+    )
+
+    respuesta = respuesta_sofia(pregunta_usuario)
+
+    st.session_state.sofia_messages.append(
+        {
+            "role": "assistant",
+            "content": respuesta
+        }
+    )
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# =========================
+# AUTO-REFRESH
+# =========================
+if auto_refresh:
+    time.sleep(refresh_seconds)
+    st.rerun()
