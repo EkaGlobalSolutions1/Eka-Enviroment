@@ -571,28 +571,10 @@ else:
 # SOFÍA – ASISTENTE EKA
 # =========================
 
-st.subheader("🤖 SOFÍA – Asistente inteligente EKA")
-
-# Guardar historial de conversación
-if "sofia_messages" not in st.session_state:
-    st.session_state.sofia_messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "Hola, soy SOFÍA, tu asistente de Inteligencia Predictiva EKA. "
-                "Puedo ayudarte a entender el IOE, las alertas, los sensores críticos "
-                "y recomendar acciones preventivas."
-            )
-        }
-    ]
-
-
-# Función que genera respuestas
 def respuesta_sofia(pregunta):
 
     pregunta = pregunta.lower()
 
-    # Estado general del sistema
     if global_ioe is not None:
         estado = classify_semaphore(global_ioe)
         ioe_texto = f"{global_ioe:.3f}"
@@ -600,13 +582,10 @@ def respuesta_sofia(pregunta):
         estado = "Sin datos"
         ioe_texto = "No disponible"
 
-
-    # Sensor más crítico
     sensor_info = None
 
     if not df_co2.empty:
         peor = df_co2.sort_values("IOE").iloc[0]
-
         sensor_info = {
             "id": int(peor["sensor_id"]),
             "ioe": peor["IOE"],
@@ -615,123 +594,124 @@ def respuesta_sofia(pregunta):
             "bat": peor["bat"]
         }
 
-
-    # Respuestas inteligentes
     if "alerta" in pregunta or "anomalía" in pregunta:
 
-        return (
-            f"He detectado que el sistema se encuentra en estado {estado}. "
-            f"El IOE global actual es {ioe_texto}. "
-            "Esto significa que existen señales de pérdida de estabilidad en la red."
-        )
+        if "VERDE" in estado:
+            return (
+                f"Actualmente el sistema está en estado {estado}, con un IOE global de {ioe_texto}. "
+                "No se observa una anomalía crítica en la monitorización de CO₂ y meteorología. "
+                "La situación es estable."
+            )
 
+        return (
+            f"El sistema de monitorización ambiental presenta estado {estado}, "
+            f"con un IOE global de {ioe_texto}. "
+            "Esto puede indicar una variación anómala en CO₂, temperatura, batería del sensor "
+            "o condiciones meteorológicas asociadas."
+        )
 
     elif "ioe" in pregunta:
 
         return (
             f"El Índice Operativo EKA actual es {ioe_texto}. "
-            f"El estado del sistema es {estado}. "
-            "Un descenso del IOE indica una posible pérdida de coherencia "
-            "y un aumento de la incertidumbre del sistema."
+            f"El estado ambiental del sistema es {estado}. "
+            "En este caso, el IOE resume la estabilidad de la monitorización de CO₂ y meteorología."
         )
-
 
     elif "sensor" in pregunta or "crítico" in pregunta:
 
         if sensor_info:
 
+            if "VERDE" in estado:
+                return (
+                    f"El sistema está en verde. Aun así, el sensor con menor IOE relativo es el Sensor {sensor_info['id']}. "
+                    f"IOE: {sensor_info['ioe']:.3f}, CO₂: {sensor_info['co2']:.0f} ppm, "
+                    f"temperatura: {sensor_info['temp']:.1f} °C y batería: {sensor_info['bat']:.2f} V. "
+                    "No implica necesariamente una incidencia, solo es el punto con menor estabilidad relativa."
+                )
+
             return (
-                f"El sensor más crítico es el Sensor {sensor_info['id']}. "
-                f"Su IOE es {sensor_info['ioe']:.3f}, "
-                f"CO₂: {sensor_info['co2']:.0f} ppm, "
-                f"Temperatura: {sensor_info['temp']:.1f} °C y "
-                f"Batería: {sensor_info['bat']:.2f} V."
+                f"El sensor que requiere más atención es el Sensor {sensor_info['id']}. "
+                f"Su IOE es {sensor_info['ioe']:.3f}, CO₂: {sensor_info['co2']:.0f} ppm, "
+                f"temperatura: {sensor_info['temp']:.1f} °C y batería: {sensor_info['bat']:.2f} V."
             )
 
-        else:
+        return "Actualmente no hay datos suficientes para identificar sensores con menor estabilidad."
 
-            return "Actualmente no dispongo de sensores críticos identificados."
-
-
-    elif "fuga" in pregunta:
+    elif "fuga" in pregunta or "agua" in pregunta or "hidráulica" in pregunta:
 
         return (
-            "No puedo confirmar una fuga únicamente con esta señal. "
-            "Sin embargo, la pérdida de estabilidad detectada por EKA "
-            "recomienda revisar presiones, caudales, válvulas y sensores cercanos."
+            "Este dashboard no está analizando una red hidráulica. "
+            "Actualmente está configurado para monitorización de CO₂ y meteorología. "
+            "Puedo ayudarte a interpretar el IOE ambiental, sensores de CO₂, temperatura, batería y datos METEO."
         )
 
+    elif "co2" in pregunta or "co₂" in pregunta:
+
+        if sensor_info:
+            return (
+                f"El sensor con menor IOE relativo es el Sensor {sensor_info['id']}, "
+                f"con CO₂ de {sensor_info['co2']:.0f} ppm. "
+                f"El estado global actual es {estado}."
+            )
+
+        return "No hay datos CO₂ suficientes en este momento."
+
+    elif "meteo" in pregunta or "meteorología" in pregunta or "tiempo" in pregunta:
+
+        return (
+            f"El IOE METEO actual es "
+            f"{ioe_meteo:.3f}" if ioe_meteo is not None else "No disponible"
+        )
 
     elif "qué hago" in pregunta or "recomienda" in pregunta or "acción" in pregunta:
 
+        if "VERDE" in estado:
+            return (
+                "El sistema está en verde. Recomendación: mantener la monitorización activa, "
+                "verificar periódicamente la calidad de los datos y conservar el auto-refresh activo."
+            )
+
         return (
             "Mis recomendaciones son:\n\n"
-            "1. Revisar los sensores con menor IOE.\n"
-            "2. Verificar posibles fallos de comunicación o sensores.\n"
-            "3. Comprobar presión y caudal en la zona afectada.\n"
-            "4. Inspeccionar válvulas, bombas y elementos próximos.\n"
-            "5. Mantener monitorización reforzada del sistema."
+            "1. Revisar sensores de CO₂ con menor IOE.\n"
+            "2. Comprobar valores altos de CO₂ o temperatura.\n"
+            "3. Verificar batería y comunicación de sensores.\n"
+            "4. Contrastar con las condiciones meteorológicas.\n"
+            "5. Mantener vigilancia reforzada si el semáforo está amarillo o rojo."
         )
-
 
     elif "riesgo" in pregunta:
 
+        if "VERDE" in estado:
+            return (
+                f"El nivel actual es {estado}. "
+                "No se aprecia riesgo relevante en la monitorización ambiental en este momento."
+            )
+
         return (
             f"El nivel de riesgo actual es {estado}. "
-            "Mi función es detectar señales tempranas antes de que ocurra una avería visible."
+            "La señal puede estar relacionada con variaciones ambientales, CO₂ elevado, temperatura, batería o datos METEO."
         )
-
 
     elif "hola" in pregunta:
 
         return (
-            "Hola, soy SOFÍA EKA. Estoy preparada para ayudarte a interpretar el estado de la red."
+            "Hola, soy SOFÍA EKA. Estoy preparada para ayudarte a interpretar la monitorización de CO₂ y meteorología."
         )
-
 
     else:
 
         return (
             "Puedo responder preguntas como:\n\n"
             "- ¿Cuál es el IOE actual?\n"
-            "- ¿Existe una anomalía?\n"
-            "- ¿Cuál es el sensor más crítico?\n"
-            "- ¿Hay riesgo de fuga?\n"
+            "- ¿Cómo está la monitorización de CO₂?\n"
+            "- ¿Qué sensor tiene menor estabilidad?\n"
+            "- ¿Cómo está la meteorología?\n"
+            "- ¿Existe algún riesgo ambiental?\n"
             "- ¿Qué acciones recomiendas?"
         )
 
-
-# Mostrar historial del chat
-for mensaje in st.session_state.sofia_messages:
-
-    with st.chat_message(mensaje["role"]):
-        st.markdown(mensaje["content"])
-
-
-# Caja de texto del usuario
-pregunta_usuario = st.chat_input(
-    "Pregunta a SOFÍA sobre el estado de la red..."
-)
-
-
-# Procesar pregunta
-if pregunta_usuario:
-
-    st.session_state.sofia_messages.append(
-        {
-            "role": "user",
-            "content": pregunta_usuario
-        }
-    )
-
-    respuesta = respuesta_sofia(pregunta_usuario)
-
-    st.session_state.sofia_messages.append(
-        {
-            "role": "assistant",
-            "content": respuesta
-        }
-    )
 
 
 # =========================
